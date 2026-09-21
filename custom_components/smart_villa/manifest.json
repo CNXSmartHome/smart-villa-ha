@@ -1,0 +1,13 @@
+{
+  "domain": "smart_villa",
+  "name": "Smart Villa",
+  "after_dependencies": ["http"],
+  "codeowners": ["@CNXSmartHome"],
+  "config_flow": true,
+  "documentation": "https://github.com/CNXSmartHome/smart-villa-ha",
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/CNXSmartHome/smart-villa-ha/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}
