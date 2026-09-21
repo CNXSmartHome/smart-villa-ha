@@ -1,0 +1,13 @@
+{
+  "title": "Smart Villa",
+  "config": {
+    "step": {
+      "user": {"title": "เชื่อมต่อ Smart Villa", "description": "สร้างรหัสใช้ครั้งเดียวใน Smart Villa OS ไม่ต้องใช้ YAML หรือ Home Assistant token", "data": {"url": "URL ของ Smart Villa", "pairing_code": "รหัสจับคู่"}},
+      "reauth_confirm": {"title": "เชื่อมต่อ Smart Villa ใหม่", "description": "สร้างรหัสจับคู่ใหม่ใน Smart Villa OS", "data": {"url": "URL ของ Smart Villa", "pairing_code": "รหัสจับคู่"}}
+    },
+    "error": {"cannot_connect": "เชื่อมต่อไม่ได้", "invalid_pairing_code": "รหัสไม่ถูกต้อง ถูกใช้แล้ว หรือหมดอายุ", "invalid_response": "Smart Villa ส่งข้อมูลตอบกลับไม่ถูกต้อง", "rate_limited": "ลองบ่อยเกินไป กรุณารอสักครู่"},
+    "abort": {"already_configured": "ติดตั้งการเชื่อมต่อนี้แล้ว", "wrong_installation": "รหัสเป็นของการติดตั้งอื่น", "reauth_successful": "ยืนยันตัวตนใหม่สำเร็จ"}
+  },
+  "options": {"step": {"init": {"title": "ตั้งค่าการเชื่อมต่อ", "data": {"heartbeat_seconds": "ช่วงส่ง heartbeat (วินาที)"}}}},
+  "issues": {"connection_failed": {"title": "การเชื่อมต่อ Smart Villa ขัดข้อง", "description": "ระบบจะเชื่อมต่อใหม่อัตโนมัติ โปรดตรวจอินเทอร์เน็ตและสถานะ revoke ใน Smart Villa OS"}}
+}

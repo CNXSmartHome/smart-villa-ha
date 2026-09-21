@@ -1,0 +1,13 @@
+{
+  "title": "Smart Villa",
+  "config": {
+    "step": {
+      "user": {"title": "Connect Smart Villa", "description": "Generate a single-use code in Smart Villa OS. No YAML or Home Assistant token is required.", "data": {"url": "Smart Villa URL", "pairing_code": "Pairing code"}},
+      "reauth_confirm": {"title": "Reconnect Smart Villa", "description": "Generate a new pairing code in Smart Villa OS.", "data": {"url": "Smart Villa URL", "pairing_code": "Pairing code"}}
+    },
+    "error": {"cannot_connect": "Cannot connect", "invalid_pairing_code": "Pairing code is invalid, used, or expired", "invalid_response": "Smart Villa returned an invalid response", "rate_limited": "Too many attempts; try again later"},
+    "abort": {"already_configured": "This installation is already configured", "wrong_installation": "The pairing code belongs to another installation", "reauth_successful": "Reauthentication successful"}
+  },
+  "options": {"step": {"init": {"title": "Connection options", "data": {"heartbeat_seconds": "Heartbeat interval (seconds)"}}}},
+  "issues": {"connection_failed": {"title": "Smart Villa connection is unavailable", "description": "The integration will reconnect automatically. Check internet access and whether the installation was revoked in Smart Villa OS."}}
+}
