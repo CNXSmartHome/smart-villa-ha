@@ -40,6 +40,10 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+class ReconciliationRequired(ConnectionError):
+    """The server requires a clean reconnect and fresh snapshots."""
+
+
 class SmartVillaBridge:
     def __init__(self, hass: HomeAssistant, entry) -> None:
         self.hass = hass
@@ -71,11 +75,25 @@ class SmartVillaBridge:
         for unsubscribe in self._unsubscribers:
             unsubscribe()
         self._unsubscribers.clear()
+        if self._websocket is not None:
+            await self._websocket.close(code=1001, message=b"integration unload")
         if self.task:
             self.task.cancel()
             with suppress(asyncio.CancelledError):
                 await self.task
         await self.store.async_save({"sequence": self.sequence})
+
+    def _clear_outbound_queue(self) -> None:
+        while not self.queue.empty():
+            with suppress(asyncio.QueueEmpty):
+                self.queue.get_nowait()
+                self.queue.task_done()
+
+    def _queue_reconciliation_snapshots(self, next_sequence: int) -> None:
+        self.sequence = next_sequence - 1
+        self._clear_outbound_queue()
+        self._enqueue(self._message("registry_snapshot", entities=self._registry_snapshot()))
+        self._enqueue(self._message("state_snapshot", states=self._state_snapshot()))
 
     def _message(self, kind: str, **payload: Any) -> dict[str, Any]:
         self.sequence += 1
@@ -195,38 +213,44 @@ class SmartVillaBridge:
                 if auth.get("code") == "AUTH_INVALID":
                     self.entry.async_start_reauth(self.hass)
                 raise PermissionError("authentication rejected")
-            self.sequence = int(auth.get("next_sequence", self.sequence + 1)) - 1
+            next_sequence = int(auth.get("next_sequence", self.sequence + 1))
             self.status.update({"connected": True, "last_error": None})
             async_delete_issue(self.hass, DOMAIN, "connection")
-            while not self.queue.empty():
-                with suppress(asyncio.QueueEmpty):
-                    self.queue.get_nowait()
-            self._enqueue(self._message("registry_snapshot", entities=self._registry_snapshot()))
-            self._enqueue(self._message("state_snapshot", states=self._state_snapshot()))
+            self._queue_reconciliation_snapshots(next_sequence)
             await self.store.async_save({"sequence": self.sequence})
             sender = asyncio.create_task(self._sender(websocket))
             heartbeat = asyncio.create_task(self._heartbeat())
+            receiver = asyncio.create_task(self._receiver(websocket))
+            tasks = {sender, heartbeat, receiver}
             try:
-                async for message in websocket:
-                    if message.type == WSMsgType.TEXT:
-                        await self._handle_server_message(websocket, message.json())
-                    elif message.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
-                        break
+                done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    exception = task.exception()
+                    if exception is not None:
+                        raise exception
+                raise ConnectionError("bridge session ended")
             finally:
-                sender.cancel()
-                heartbeat.cancel()
-                with suppress(asyncio.CancelledError):
-                    await sender
-                with suppress(asyncio.CancelledError):
-                    await heartbeat
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
                 self._websocket = None
                 self.status["connected"] = False
+
+    async def _receiver(self, websocket: ClientWebSocketResponse) -> None:
+        async for message in websocket:
+            if message.type == WSMsgType.TEXT:
+                await self._handle_server_message(websocket, message.json())
+            elif message.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
+                return
 
     async def _sender(self, websocket: ClientWebSocketResponse) -> None:
         while True:
             message = await self.queue.get()
-            await websocket.send_json(message)
-            await self.store.async_save({"sequence": self.sequence})
+            try:
+                await websocket.send_json(message)
+                await self.store.async_save({"sequence": self.sequence})
+            finally:
+                self.queue.task_done()
 
     async def _heartbeat(self) -> None:
         interval = self.entry.options.get("heartbeat_seconds", HEARTBEAT_SECONDS)
@@ -239,6 +263,24 @@ class SmartVillaBridge:
         kind = message.get("type")
         if kind == "command":
             await self._handle_command(websocket, message)
+        elif kind == "error" and (
+            message.get("code") == "OUT_OF_ORDER" or message.get("reconciliation_required") is True
+        ):
+            expected = message.get("expected_sequence")
+            received = message.get("received_sequence")
+            self.status.update(
+                {
+                    "last_error": "sequence_reconciliation",
+                    "sequence_error": {
+                        "category": "OUT_OF_ORDER",
+                        "expected_sequence": expected if isinstance(expected, int) else None,
+                        "received_sequence": received if isinstance(received, int) else None,
+                    },
+                }
+            )
+            _LOGGER.warning("Smart Villa bridge requested sequence reconciliation (OUT_OF_ORDER)")
+            await websocket.close(code=4009, message=b"reconciliation required")
+            raise ReconciliationRequired("OUT_OF_ORDER")
         elif kind == "credential_rotate":
             credential = message.get("credential")
             version = message.get("credential_version")
