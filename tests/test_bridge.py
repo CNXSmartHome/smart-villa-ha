@@ -1,7 +1,15 @@
+import asyncio
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from custom_components.smart_villa.bridge import SmartVillaBridge
+import pytest
+
+from custom_components.smart_villa.bridge import ReconciliationRequired, SmartVillaBridge
+from custom_components.smart_villa.const import INTEGRATION_VERSION
+from custom_components.smart_villa.diagnostics import async_get_config_entry_diagnostics
 
 
 def test_command_mapping_and_door_exclusion():
@@ -85,3 +93,146 @@ async def test_transient_disconnect_reconnects_with_backoff():
     assert attempts == 2
     assert bridge.status["reconnects"] == 1
     sleep.assert_awaited_once()
+
+
+def make_bridge() -> SmartVillaBridge:
+    bridge = object.__new__(SmartVillaBridge)
+    bridge.hass = MagicMock()
+    bridge.entry = MagicMock()
+    bridge.sequence = 0
+    bridge.queue = asyncio.Queue(maxsize=1000)
+    bridge.status = {"connected": False, "last_error": None, "reconnects": 0}
+    bridge._websocket = None
+    bridge._stopping = False
+    bridge._unsubscribers = []
+    return bridge
+
+
+async def test_burst_state_events_and_heartbeats_keep_monotonic_sequences():
+    bridge = make_bridge()
+
+    async def emit(index: int) -> None:
+        state = SimpleNamespace(
+            entity_id=f"light.synthetic_{index}",
+            domain="light",
+            state="on" if index % 2 else "off",
+            attributes={},
+            last_changed=datetime.now(UTC),
+            last_updated=datetime.now(UTC),
+        )
+        await bridge._state_changed(SimpleNamespace(data={"new_state": state}))
+        if index % 10 == 0:
+            bridge._enqueue(bridge._message("heartbeat"))
+
+    await asyncio.gather(*(emit(index) for index in range(50)))
+    messages = []
+    while not bridge.queue.empty():
+        messages.append(bridge.queue.get_nowait())
+    assert [message["seq"] for message in messages] == list(range(1, len(messages) + 1))
+    assert sum(message["type"] == "state_changed" for message in messages) == 50
+    assert sum(message["type"] == "heartbeat" for message in messages) == 5
+
+
+async def test_out_of_order_closes_socket_and_requests_reconnect():
+    bridge = make_bridge()
+    websocket = MagicMock()
+    websocket.close = AsyncMock()
+
+    with pytest.raises(ReconciliationRequired):
+        await bridge._handle_server_message(
+            websocket,
+            {
+                "type": "error",
+                "code": "OUT_OF_ORDER",
+                "expected_sequence": 30,
+                "received_sequence": 31,
+                "reconciliation_required": True,
+            },
+        )
+
+    websocket.close.assert_awaited_once_with(code=4009, message=b"reconciliation required")
+    assert bridge.status["sequence_error"] == {
+        "category": "OUT_OF_ORDER",
+        "expected_sequence": 30,
+        "received_sequence": 31,
+    }
+
+
+def test_reconnect_clears_stale_queue_and_sends_fresh_snapshots():
+    bridge = make_bridge()
+    bridge.sequence = 91
+    bridge.queue.put_nowait({"type": "state_changed", "seq": 91, "event": {"state": "redacted"}})
+    bridge._registry_snapshot = MagicMock(return_value=[{"entity_id": "light.synthetic"}])
+    bridge._state_snapshot = MagicMock(return_value=[{"entity_id": "light.synthetic", "state": "on"}])
+
+    bridge._queue_reconciliation_snapshots(30)
+
+    registry = bridge.queue.get_nowait()
+    state = bridge.queue.get_nowait()
+    assert (registry["type"], registry["seq"]) == ("registry_snapshot", 30)
+    assert (state["type"], state["seq"]) == ("state_snapshot", 31)
+    assert bridge.queue.empty()
+
+
+async def test_shutdown_cleans_up_listener_socket_and_background_task():
+    bridge = make_bridge()
+    unsubscribe = MagicMock()
+    bridge._unsubscribers = [unsubscribe]
+    bridge.store = MagicMock()
+    bridge.store.async_save = AsyncMock()
+    bridge._websocket = MagicMock()
+    bridge._websocket.close = AsyncMock()
+    bridge.task = asyncio.create_task(asyncio.sleep(60))
+
+    await bridge.async_stop()
+
+    unsubscribe.assert_called_once_with()
+    bridge._websocket.close.assert_awaited_once_with(code=1001, message=b"integration unload")
+    assert bridge.task.cancelled()
+    bridge.store.async_save.assert_awaited_once_with({"sequence": 0})
+
+
+async def test_sender_connection_error_propagates_to_session_supervisor():
+    bridge = make_bridge()
+    bridge.store = MagicMock()
+    bridge.store.async_save = AsyncMock()
+    bridge.queue.put_nowait({"type": "heartbeat", "seq": 1})
+    websocket = MagicMock()
+    websocket.send_json = AsyncMock(side_effect=ConnectionError("socket closed"))
+
+    with pytest.raises(ConnectionError, match="socket closed"):
+        await bridge._sender(websocket)
+
+    await asyncio.wait_for(bridge.queue.join(), timeout=0.1)
+
+
+async def test_diagnostics_expose_only_safe_bridge_status():
+    bridge = make_bridge()
+    bridge.status.update(
+        {
+            "sequence_error": {"category": "OUT_OF_ORDER", "expected_sequence": 3, "received_sequence": 4},
+            "credential": "must-not-appear",
+            "entity_state": "must-not-appear",
+        }
+    )
+    bridge.entry.entry_id = "entry-1"
+    bridge.entry.data = {"credential": "must-not-appear", "installation_id": "installation-1"}
+    bridge.entry.options = {}
+    bridge.hass.data = {"smart_villa": {"entry-1": bridge}}
+
+    diagnostics = await async_get_config_entry_diagnostics(bridge.hass, bridge.entry)
+
+    assert "credential" not in diagnostics["status"]
+    assert "entity_state" not in diagnostics["status"]
+    assert diagnostics["entry"]["credential"] != "must-not-appear"
+    assert diagnostics["status"]["sequence_error"]["category"] == "OUT_OF_ORDER"
+
+
+def test_manifest_and_upgrade_notes_use_the_next_version():
+    root = Path(__file__).parents[1]
+    manifest = json.loads((root / "custom_components/smart_villa/manifest.json").read_text())
+    releases = (root / "RELEASES.md").read_text()
+    assert manifest["version"] == INTEGRATION_VERSION == "1.0.1"
+    assert 'version = "1.0.1"' in (root / "pyproject.toml").read_text()
+    assert "## 1.0.1" in releases
+    assert "Intended release tag: `v1.0.1`" in releases
