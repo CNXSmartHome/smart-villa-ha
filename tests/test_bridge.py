@@ -7,8 +7,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.smart_villa.bridge import ReconciliationRequired, SmartVillaBridge
-from custom_components.smart_villa.const import INTEGRATION_VERSION
+from custom_components.smart_villa.bridge import (
+    HeartbeatLost,
+    ReconciliationRequired,
+    SmartVillaBridge,
+    backoff_seconds,
+)
+from custom_components.smart_villa.const import HEARTBEAT_SECONDS, INTEGRATION_VERSION, MAX_BACKOFF_SECONDS
 from custom_components.smart_villa.diagnostics import async_get_config_entry_diagnostics
 
 
@@ -73,6 +78,7 @@ async def test_lock_command_is_rejected_without_service_call():
 async def test_transient_disconnect_reconnects_with_backoff():
     bridge = object.__new__(SmartVillaBridge)
     bridge._stopping = False
+    bridge._session_authenticated = False
     bridge.status = {"connected": False, "last_error": None, "reconnects": 0}
     bridge.hass = MagicMock()
     attempts = 0
@@ -105,6 +111,9 @@ def make_bridge() -> SmartVillaBridge:
     bridge._websocket = None
     bridge._stopping = False
     bridge._unsubscribers = []
+    bridge._session_authenticated = False
+    bridge._close_after_drain = False
+    bridge._last_inbound = __import__("time").monotonic()
     return bridge
 
 
@@ -232,7 +241,206 @@ def test_manifest_and_upgrade_notes_use_the_next_version():
     root = Path(__file__).parents[1]
     manifest = json.loads((root / "custom_components/smart_villa/manifest.json").read_text())
     releases = (root / "RELEASES.md").read_text()
-    assert manifest["version"] == INTEGRATION_VERSION == "1.0.1"
-    assert 'version = "1.0.1"' in (root / "pyproject.toml").read_text()
-    assert "## 1.0.1" in releases
-    assert "Intended release tag: `v1.0.1`" in releases
+    assert manifest["version"] == INTEGRATION_VERSION == "1.0.2"
+    assert 'version = "1.0.2"' in (root / "pyproject.toml").read_text()
+    assert "## 1.0.2" in releases
+    assert "Intended release tag: `v1.0.2`" in releases
+
+
+# ── v1.0.2 reconnect (incident 2026-09-23) ─────────────────────────────────────────────────────────────────────
+
+
+def test_backoff_schedule_is_1_2_5_15_then_capped_at_30():
+    # failures is 1-based: the first failed attempt waits 1 s, the second 2 s, …
+    assert [backoff_seconds(n) for n in range(1, 8)] == [1.0, 2.0, 5.0, 15.0, 30.0, 30.0, 30.0]
+    assert backoff_seconds(0) == 1.0  # defensive: never negative-index the schedule
+    assert backoff_seconds(4, jitter=0.7) == 15.7
+    assert backoff_seconds(5, jitter=0.9) == MAX_BACKOFF_SECONDS  # cap applies AFTER jitter
+    assert backoff_seconds(50, jitter=1.0) == MAX_BACKOFF_SECONDS
+
+
+async def test_backoff_resets_after_an_authenticated_session_dropped():
+    """1.0.1 bug: backoff only reset when the session returned normally, which never happens → 300 s per drop."""
+    bridge = object.__new__(SmartVillaBridge)
+    bridge._stopping = False
+    bridge._session_authenticated = False
+    bridge.status = {"connected": False, "last_error": None, "reconnects": 0}
+    bridge.hass = MagicMock()
+    attempt = 0
+
+    async def session():
+        nonlocal attempt
+        attempt += 1
+        if attempt <= 4:
+            # four sessions that authenticated and then dropped (Caddy restart ×4)
+            bridge._session_authenticated = True
+            raise ConnectionError("bridge session ended")
+        if attempt <= 6:
+            # then two failures to even establish (server down)
+            raise ConnectionError("connect failed")
+        bridge._stopping = True
+
+    bridge._connected_session = session
+    with (
+        patch("custom_components.smart_villa.bridge.asyncio.sleep", AsyncMock()) as sleep,
+        patch("custom_components.smart_villa.bridge.async_create_issue"),
+        patch("custom_components.smart_villa.bridge.random.uniform", return_value=0.0),
+    ):
+        await bridge._run()
+    delays = [call.args[0] for call in sleep.await_args_list]
+    # drops after an authenticated session restart at 1 s (failure #1); the two establishment failures that follow
+    # are consecutive failures #2 and #3 → 2 s, 5 s — the schedule is truly 1, 2, 5, 15, 30
+    assert delays == [1.0, 1.0, 1.0, 1.0, 2.0, 5.0]
+    assert bridge.status["reconnects"] == 6
+    assert bridge.status["consecutive_failures"] == 3
+
+
+async def test_heartbeat_watchdog_ends_session_when_server_goes_silent():
+    bridge = make_bridge()
+    bridge.entry.options = {"heartbeat_seconds": 15}
+    bridge._last_inbound = __import__("time").monotonic() - 31  # > 2 intervals without any server frame
+    with patch("custom_components.smart_villa.bridge.asyncio.sleep", AsyncMock()):
+        with pytest.raises(HeartbeatLost):
+            await bridge._heartbeat()
+    assert bridge.status["last_error"] == "heartbeat_ack_missing"
+    assert bridge.queue.empty()  # no further heartbeat is queued on a dead socket
+
+
+async def test_heartbeat_keeps_going_while_server_frames_arrive():
+    bridge = make_bridge()
+    bridge.entry.options = {"heartbeat_seconds": HEARTBEAT_SECONDS}
+    calls = 0
+
+    async def sleep(_seconds):
+        nonlocal calls
+        calls += 1
+        bridge._last_inbound = __import__("time").monotonic()  # a server ack arrived during the interval
+        if calls == 3:
+            raise asyncio.CancelledError
+
+    with patch("custom_components.smart_villa.bridge.asyncio.sleep", sleep):
+        with pytest.raises(asyncio.CancelledError):
+            await bridge._heartbeat()
+    assert bridge.queue.qsize() == 2
+    assert all(bridge.queue.get_nowait()["type"] == "heartbeat" for _ in range(2))
+
+
+async def test_receiver_records_inbound_time_and_ends_on_close():
+    bridge = make_bridge()
+    bridge._last_inbound = 0.0
+    text = SimpleNamespace(type=__import__("aiohttp").WSMsgType.TEXT, json=lambda: {"type": "ack", "ref_id": "x"})
+    closed = SimpleNamespace(type=__import__("aiohttp").WSMsgType.CLOSED)
+
+    class FakeWs:
+        def __init__(self, frames):
+            self._frames = frames
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._frames:
+                raise StopAsyncIteration
+            return self._frames.pop(0)
+
+    await bridge._receiver(FakeWs([text, closed, text]))  # returns at CLOSED, never sees the third frame
+    assert bridge._last_inbound > 0.0
+
+
+async def test_service_call_exception_still_sends_negative_ack():
+    bridge = make_bridge()
+    bridge.hass.services.async_call = AsyncMock(side_effect=RuntimeError("entity unavailable"))
+    await bridge._handle_command(
+        MagicMock(),
+        {
+            "command_id": "command-9",
+            "capability": "SWITCH_OFF",
+            "entity_id": "light.room",
+            "params": {},
+            "expires_at": (datetime.now(UTC) + timedelta(seconds=2)).isoformat(),
+        },
+    )
+    ack = bridge.queue.get_nowait()
+    assert (ack["type"], ack["command_id"], ack["success"]) == ("command_ack", "command-9", False)
+    assert ack["error_code"] == "SERVICE_CALL_FAILED"
+    assert "entity unavailable" not in json.dumps(ack)  # category only, never the exception text
+
+
+async def test_cancellation_during_command_is_not_masked_as_failure():
+    bridge = make_bridge()
+    bridge.hass.services.async_call = AsyncMock(side_effect=asyncio.CancelledError)
+    with pytest.raises(asyncio.CancelledError):
+        await bridge._handle_command(
+            MagicMock(),
+            {
+                "command_id": "command-10",
+                "capability": "SWITCH_ON",
+                "entity_id": "light.room",
+                "params": {},
+                "expires_at": (datetime.now(UTC) + timedelta(seconds=2)).isoformat(),
+            },
+        )
+    assert bridge.queue.empty()
+
+
+def test_full_queue_never_drops_a_command_ack_and_defers_the_close_to_the_sender():
+    bridge = make_bridge()
+    bridge.queue = asyncio.Queue(maxsize=2)
+    bridge.hass.async_create_task = MagicMock()
+    bridge._websocket = MagicMock()
+    bridge._websocket.close = AsyncMock()
+    bridge._enqueue(bridge._message("state_changed", event={"entity_id": "light.a"}))
+    bridge._enqueue(bridge._message("state_changed", event={"entity_id": "light.b"}))
+    bridge._enqueue(bridge._message("state_changed", event={"entity_id": "light.c"}))  # dropped: overflow
+    assert bridge.status["last_error"] == "outbound_queue_overflow"
+    bridge._enqueue(bridge._message("command_ack", command_id="c1", success=True))  # makes room, kept
+    kinds = [bridge.queue.get_nowait()["type"] for _ in range(2)]
+    assert kinds == ["state_changed", "command_ack"]
+    # nothing closed the socket synchronously — the sender owns the close after the drain
+    bridge._websocket.close.assert_not_awaited()
+    bridge.hass.async_create_task.assert_not_called()
+    assert bridge._close_after_drain is True
+
+
+async def test_sender_transmits_the_ack_before_the_reconciliation_close():
+    bridge = make_bridge()
+    bridge.store = MagicMock()
+    bridge.store.async_save = AsyncMock()
+    bridge.queue = asyncio.Queue(maxsize=2)
+    bridge._websocket = MagicMock()
+    events: list[str] = []
+    websocket = MagicMock()
+
+    async def send_json(message):
+        events.append(f"send:{message['type']}")
+
+    async def close(**_kwargs):
+        events.append("close")
+
+    websocket.send_json = send_json
+    websocket.close = close
+    bridge._enqueue(bridge._message("state_changed", event={"entity_id": "light.a"}))
+    bridge._enqueue(bridge._message("state_changed", event={"entity_id": "light.b"}))
+    bridge._enqueue(bridge._message("state_changed", event={"entity_id": "light.c"}))  # overflow → flag set
+    bridge._enqueue(bridge._message("command_ack", command_id="c1", success=True))
+
+    with pytest.raises(ConnectionError, match="reconciling"):
+        await bridge._sender(websocket)
+
+    assert events == ["send:state_changed", "send:command_ack", "close"]  # ack on the wire BEFORE close
+    assert bridge._close_after_drain is False
+    assert bridge.queue.empty()
+
+
+def test_reconnect_sends_exactly_one_registry_and_one_state_snapshot_with_next_sequence():
+    bridge = make_bridge()
+    bridge.sequence = 15_260
+    for seq in (15_258, 15_259, 15_260):
+        bridge.queue.put_nowait({"type": "state_changed", "seq": seq})
+    bridge._registry_snapshot = MagicMock(return_value=[])
+    bridge._state_snapshot = MagicMock(return_value=[])
+    bridge._queue_reconciliation_snapshots(15_261)
+    frames = [bridge.queue.get_nowait() for _ in range(2)]
+    assert [(f["type"], f["seq"]) for f in frames] == [("registry_snapshot", 15_261), ("state_snapshot", 15_262)]
+    assert bridge.queue.empty()
+    assert bridge._registry_snapshot.call_count == 1 and bridge._state_snapshot.call_count == 1
