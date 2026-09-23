@@ -20,6 +20,8 @@ Incident 2026-09-23 (Smart Villa `INCIDENT-GUEST-QR-2026-09-23.md`): after every
 - `command_ack` is sent on every success/failure path; a full outbound queue now drops the oldest queued event to
   make room for an ack instead of dropping the ack. Task cancellation is never masked as a failure ack.
 - Diagnostics gain `consecutive_failures`.
+- Fix `repairs` platform import (`homeassistant.helpers.issue_registry` has no `RepairsFlow`; it lives in
+  `homeassistant.components.repairs`) — HA 2026.9 logged an import error on every load.
 
 ### Upgrade
 
