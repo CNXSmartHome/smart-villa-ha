@@ -50,14 +50,16 @@ class HeartbeatLost(ConnectionError):
     """The server stopped acknowledging heartbeats (half-open socket)."""
 
 
-def backoff_seconds(attempt: int, jitter: float = 0.0) -> float:
-    """Reconnect delay for the N-th consecutive failed attempt (0-based): 1, 2, 5, 15, 30, 30, … plus jitter.
+def backoff_seconds(failures: int, jitter: float = 0.0) -> float:
+    """Reconnect delay after the N-th consecutive failed attempt (1-based): 1, 2, 5, 15 then 30 s, capped at
+    MAX_BACKOFF_SECONDS *after* jitter is added.
 
-    ``attempt`` counts consecutive failures since the last *authenticated* session, so one dropped socket
-    reconnects after ~1 s instead of inheriting the delay of every earlier drop.
+    ``failures`` counts consecutive failures since the last *authenticated* session (so one dropped socket
+    reconnects after ~1 s); ``failures <= 1`` maps to the first step.
     """
-    base = RECONNECT_BACKOFF_STEPS[attempt] if attempt < len(RECONNECT_BACKOFF_STEPS) else MAX_BACKOFF_SECONDS
-    return min(MAX_BACKOFF_SECONDS, base) + max(0.0, jitter)
+    index = max(0, failures - 1)
+    base = RECONNECT_BACKOFF_STEPS[index] if index < len(RECONNECT_BACKOFF_STEPS) else MAX_BACKOFF_SECONDS
+    return min(float(MAX_BACKOFF_SECONDS), base + max(0.0, jitter))
 
 
 class SmartVillaBridge:
@@ -73,6 +75,8 @@ class SmartVillaBridge:
         self._unsubscribers: list[Any] = []
         # Set when a session passed authentication; the reconnect loop resets its backoff on that basis.
         self._session_authenticated = False
+        # Set on outbound overflow; the sender closes the socket once the queue (with any acks) is drained.
+        self._close_after_drain = False
         # Monotonic time of the last frame received from the server (ack / command / error / auth_ok).
         self._last_inbound = time.monotonic()
         self.status: dict[str, Any] = {
@@ -131,14 +135,14 @@ class SmartVillaBridge:
         if self.queue.full():
             self.status["last_error"] = "outbound_queue_overflow"
             if message.get("type") == "command_ack":
-                # An ack must reach the server on every path: make room by dropping the oldest queued event
-                # (state will be re-snapshotted after the reconcile that overflow triggers below).
+                # An ack must reach the server on every path: make room by dropping the oldest queued event.
                 with suppress(asyncio.QueueEmpty):
                     self.queue.get_nowait()
                     self.queue.task_done()
                 self.queue.put_nowait(message)
-            if self._websocket is not None:
-                self.hass.async_create_task(self._websocket.close(code=1013, message=b"reconcile"))
+            # Do NOT close here: the sender closes the socket for reconciliation only after it has drained the
+            # queue (the ack included), so the ack is transmitted before the close frame.
+            self._close_after_drain = True
             return
         self.queue.put_nowait(message)
 
@@ -205,7 +209,8 @@ class SmartVillaBridge:
             except Exception as err:  # noqa: BLE001 - category only, never secret values
                 # A session that had authenticated and then dropped (Caddy restart, network cut, HA sleep) starts the
                 # schedule over at ~1 s. Only repeated failures *to establish* a session escalate towards the 30 s cap.
-                failures = 0 if self._session_authenticated else failures + 1
+                # 1st attempt after an authenticated session → 1 s; consecutive establishment failures → 2, 5, 15, 30.
+                failures = 1 if self._session_authenticated else failures + 1
                 delay = backoff_seconds(failures, random.uniform(0, 1.0))
                 self.status.update(
                     {
@@ -256,6 +261,7 @@ class SmartVillaBridge:
                 raise PermissionError("authentication rejected")
             next_sequence = int(auth.get("next_sequence", self.sequence + 1))
             self._session_authenticated = True
+            self._close_after_drain = False
             self._last_inbound = time.monotonic()
             self.status.update({"connected": True, "last_error": None, "consecutive_failures": 0})
             async_delete_issue(self.hass, DOMAIN, "connection")
@@ -296,6 +302,12 @@ class SmartVillaBridge:
                 await self.store.async_save({"sequence": self.sequence})
             finally:
                 self.queue.task_done()
+            if self._close_after_drain and self.queue.empty():
+                # Overflow reconciliation: every queued frame (acks included) has been written; now close so the
+                # session supervisor reconnects and re-snapshots.
+                self._close_after_drain = False
+                await websocket.close(code=1013, message=b"reconcile")
+                raise ConnectionError("outbound queue overflow: reconciling")
 
     async def _heartbeat(self) -> None:
         interval = self.entry.options.get("heartbeat_seconds", HEARTBEAT_SECONDS)

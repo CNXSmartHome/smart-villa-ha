@@ -21,7 +21,8 @@ COMMAND_CAPABILITIES = {
 }
 MAX_QUEUE_SIZE = 1000
 HEARTBEAT_SECONDS = 15
-# Reconnect schedule (seconds) after a failed/ended session: 1, 2, 5, 15 then capped at 30, each with jitter.
+# Reconnect schedule (seconds) for the 1st, 2nd, 3rd, 4th consecutive failed attempt: 1, 2, 5, 15; then 30.
+# Jitter (0–1 s) is added before the 30 s cap is applied.
 # 1.0.1 doubled up to 300 s and never reset, so after a handful of drops every reconnect waited ~5 minutes.
 RECONNECT_BACKOFF_STEPS = (1.0, 2.0, 5.0, 15.0)
 MAX_BACKOFF_SECONDS = 30

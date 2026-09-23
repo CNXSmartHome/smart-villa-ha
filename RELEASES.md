@@ -10,15 +10,17 @@ Incident 2026-09-23 (Smart Villa `INCIDENT-GUEST-QR-2026-09-23.md`): after every
 - Root cause: the reconnect loop only reset its backoff when `_connected_session()` returned normally — which never
   happens (a session always ends by raising). Each drop therefore doubled the delay for the lifetime of the
   integration: 1, 2, 4 … 256, 300, 300, … Production had accumulated the cap.
-- Backoff is now 1, 2, 5, 15 s then capped at 30 s with jitter, and it resets whenever the previous session had
-  authenticated. Only repeated failures to *establish* a session escalate.
+- Backoff is now 1, 2, 5, 15 s for the 1st–4th consecutive failed attempt, then 30 s; jitter (0–1 s) is added
+  before the 30 s cap. It resets whenever the previous session had authenticated — only repeated failures to
+  *establish* a session escalate.
 - Reconnect triggers: socket close/error, any of sender / receiver / heartbeat task ending or raising, and a new
   heartbeat-acknowledgement watchdog — no server frame for 2 heartbeat intervals (30 s) ends the session
   (`HeartbeatLost`), so a half-open socket behind a recreated proxy is detected without waiting for TCP.
 - After reconnect: unchanged — `auth_ok.next_sequence` is adopted, the stale outbound queue is cleared, one
   registry + one state snapshot are sent.
-- `command_ack` is sent on every success/failure path; a full outbound queue now drops the oldest queued event to
-  make room for an ack instead of dropping the ack. Task cancellation is never masked as a failure ack.
+- `command_ack` is sent on every success/failure path; a full outbound queue drops the oldest queued event to make
+  room for an ack instead of dropping the ack, and the reconciliation close is deferred to the sender so the ack
+  is transmitted before the socket closes. Task cancellation is never masked as a failure ack.
 - Diagnostics gain `consecutive_failures`.
 - Fix `repairs` platform import (`homeassistant.helpers.issue_registry` has no `RepairsFlow`; it lives in
   `homeassistant.components.repairs`) — HA 2026.9 logged an import error on every load.
