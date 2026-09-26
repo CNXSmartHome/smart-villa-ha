@@ -25,6 +25,22 @@ def test_command_mapping_and_door_exclusion():
     )
 
 
+def test_fan_mode_mapping_and_validation():
+    assert SmartVillaBridge._service_call("CLIMATE_SET_FAN_MODE", "climate.bedroom", {"fanMode": "high"}) == (
+        "set_fan_mode",
+        {"entity_id": "climate.bedroom", "fan_mode": "high"},
+    )
+    for entity_id, params in [
+        ("light.room", {"fanMode": "high"}),
+        ("climate.bedroom", {}),
+        ("climate.bedroom", {"fanMode": 3}),
+        ("climate.bedroom", {"fanMode": ""}),
+        ("climate.bedroom", {"fanMode": "x" * 25}),
+    ]:
+        with pytest.raises(ValueError, match="INVALID_PARAMS"):
+            SmartVillaBridge._service_call("CLIMATE_SET_FAN_MODE", entity_id, params)
+
+
 async def test_expired_command_gets_explicit_negative_ack():
     bridge = object.__new__(SmartVillaBridge)
     bridge.hass = MagicMock()
@@ -241,10 +257,10 @@ def test_manifest_and_upgrade_notes_use_the_next_version():
     root = Path(__file__).parents[1]
     manifest = json.loads((root / "custom_components/smart_villa/manifest.json").read_text())
     releases = (root / "RELEASES.md").read_text()
-    assert manifest["version"] == INTEGRATION_VERSION == "1.0.2"
-    assert 'version = "1.0.2"' in (root / "pyproject.toml").read_text()
-    assert "## 1.0.2" in releases
-    assert "Intended release tag: `v1.0.2`" in releases
+    assert manifest["version"] == INTEGRATION_VERSION == "1.0.3"
+    assert 'version = "1.0.3"' in (root / "pyproject.toml").read_text()
+    assert "## 1.0.3" in releases
+    assert "Intended release tag: `v1.0.3`" in releases
 
 
 # ── v1.0.2 reconnect (incident 2026-09-23) ─────────────────────────────────────────────────────────────────────

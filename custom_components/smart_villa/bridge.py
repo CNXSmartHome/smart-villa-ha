@@ -398,4 +398,12 @@ class SmartVillaBridge:
         if capability == "CLIMATE_SET_TEMPERATURE":
             data["temperature"] = float(params.get("temperature", params.get("temp", 25)))
             return "set_temperature", data
+        if capability == "CLIMATE_SET_FAN_MODE":
+            # 1.0.3: guest fan speed. The server only sends a mode this entity reported in `fan_modes`; still refuse
+            # anything that is not a short string or not a climate entity (HA would reject it anyway).
+            fan_mode = params.get("fanMode")
+            if not entity_id.startswith("climate.") or not isinstance(fan_mode, str) or not 0 < len(fan_mode) <= 24:
+                raise ValueError("INVALID_PARAMS")
+            data["fan_mode"] = fan_mode
+            return "set_fan_mode", data
         return mapping[capability], data
