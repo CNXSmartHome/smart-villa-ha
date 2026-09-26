@@ -1,5 +1,22 @@
 # Release and upgrade notes
 
+## 1.0.3
+
+Intended release tag: `v1.0.3` (tag only after the Smart Villa PR with #386 is merged and deployed).
+
+- New command capability `CLIMATE_SET_FAN_MODE` → `climate.set_fan_mode` (`params.fanMode`). Smart Villa offers it to
+  guests only for AC entities that report `fan_modes`, and only when this integration reports version ≥ 1.0.3, so
+  older installs never receive it. Rejected with `INVALID_PARAMS` for non-climate entities or a non-string / empty /
+  > 24-char mode. Door/lock domains remain refused (`TTLOCK_ONLY` on the server; not in `SUPPORTED_DOMAINS` here).
+- No protocol/schema change (`SCHEMA_VERSION` stays 1); state events already carry all attributes, so `fan_mode` /
+  `fan_modes` reach Smart Villa without changes.
+
+### Upgrade
+
+HACS → Smart Villa → update to 1.0.3 → restart Home Assistant. No re-pair. Check Smart Villa `HaInstallation`
+`integrationVersion = 1.0.3`; the fan speed row appears on `/g/room` for ACs whose HA entity lists `fan_modes`.
+
+
 ## 1.0.2
 
 Intended release tag: `v1.0.2` (create only after this change is approved; do not tag from this PR).

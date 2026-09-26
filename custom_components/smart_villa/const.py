@@ -6,7 +6,7 @@ CONF_CREDENTIAL = "credential"
 CONF_WEBSOCKET_URL = "websocket_url"
 CONF_CREDENTIAL_VERSION = "credential_version"
 SCHEMA_VERSION = 1
-INTEGRATION_VERSION = "1.0.2"
+INTEGRATION_VERSION = "1.0.3"
 SUPPORTED_DOMAINS = {"light", "switch", "climate", "cover", "fan", "input_boolean", "scene", "binary_sensor", "sensor"}
 COMMAND_CAPABILITIES = {
     "SWITCH_ON",
@@ -15,6 +15,7 @@ COMMAND_CAPABILITIES = {
     "CLIMATE_TURN_ON",
     "CLIMATE_TURN_OFF",
     "CLIMATE_SET_TEMPERATURE",
+    "CLIMATE_SET_FAN_MODE",
     "CURTAIN_OPEN",
     "CURTAIN_CLOSE",
     "SCENE_ACTIVATE",
